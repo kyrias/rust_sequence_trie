@@ -72,9 +72,8 @@ mod tests;
 /// # The Sequence Trie Invariant
 /// All leaf nodes have non-trivial values (not equal to `None`). This invariant is maintained by
 /// the insertion and removal methods and can be relied upon.
-#[cfg(feature = "serde")]
-#[derive(Serialize, Deserialize)]
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SequenceTrie<K, V>
     where K: TrieKey
 {
