@@ -26,6 +26,9 @@ use serde::{Serialize, Deserialize};
 #[macro_use]
 extern crate serde;
 
+#[macro_use]
+extern crate failure;
+
 #[cfg(test)]
 mod tests;
 #[cfg(all(test, feature = "serde"))]
@@ -102,6 +105,9 @@ pub struct SequenceTrie<K, V, S = RandomState>
 
     /// Node children as a hashmap keyed by key fragments.
     children: HashMap<K, SequenceTrie<K, V, S>, S>,
+
+    /// Whether only leaves can store values.
+    values_at_leaves: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +125,9 @@ pub struct SequenceTrie<K, V, S = RandomState>
 
     /// Node children as a btreemap keyed by key fragments.
     children: BTreeMap<K, SequenceTrie<K, V, S>>,
+
+    /// Whether only leaves can store values.
+    values_at_leaves: bool,
 
     /// Fake hasher for compatibility.
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -145,7 +154,12 @@ impl<K, V> SequenceTrie<K, V>
 {
     /// Creates a new `SequenceTrie` node with no value and an empty child map.
     pub fn new() -> SequenceTrie<K, V> {
-        SequenceTrie::with_hasher(RandomState::new())
+        SequenceTrie::with_hasher(RandomState::new(), false)
+    }
+
+    /// Same as `new`, but only store values at the leaves
+    pub fn new_values_at_leaves() -> SequenceTrie<K, V> {
+        SequenceTrie::with_hasher(RandomState::new(), true)
     }
 }
 
@@ -154,10 +168,11 @@ impl<K, V, S> SequenceTrie<K, V, S>
     where K: TrieKey,
           S: BuildHasher + Default + Clone,
 {
-    pub fn with_hasher(hash_builder: S) -> SequenceTrie<K, V, S> {
+    pub fn with_hasher(hash_builder: S, values_at_leaves: bool) -> SequenceTrie<K, V, S> {
         SequenceTrie {
             value: None,
             children: HashMap::with_hasher(hash_builder),
+            values_at_leaves: values_at_leaves,
         }
     }
 }
@@ -168,7 +183,12 @@ impl<K, V> SequenceTrie<K, V>
 {
     /// Creates a new `SequenceTrie` node with no value and an empty child map.
     pub fn new() -> SequenceTrie<K, V> {
-        Self::new_generic()
+        Self::new_generic(false)
+    }
+
+    /// Same as `new`, but only store values at the leaves
+    pub fn new_values_at_leaves() -> SequenceTrie<K, V> {
+        Self::new_generic(true)
     }
 }
 
@@ -178,13 +198,24 @@ impl<K, V, S> SequenceTrie<K, V, S>
           S: BuildHasher + Default + Clone,
 {
     /// Creates a new `SequenceTrie` node with no value and an empty child map.
-    pub fn new_generic() -> SequenceTrie<K, V, S> {
+    pub fn new_generic(values_at_leaves: bool) -> SequenceTrie<K, V, S> {
         SequenceTrie {
             value: None,
             children: BTreeMap::new(),
+            values_at_leaves: values_at_leaves,
             _phantom: PhantomData,
         }
     }
+}
+
+
+#[derive(Debug, Fail)]
+pub enum InsertError {
+    #[fail(display = "leaf node for key already has children")]
+    LeafNodeHasChildren,
+
+    #[fail(display = "non-leaf node for key already has a value")]
+    NonLeafNodeHasValue,
 }
 
 impl<K, V, S> SequenceTrie<K, V, S>
@@ -217,7 +248,7 @@ impl<K, V, S> SequenceTrie<K, V, S>
     ///
     /// Returns `None` if the key did not already correspond to a value, otherwise the old value is
     /// returned.
-    pub fn insert<'key, I, Q: 'key + ?Sized>(&mut self, key: I, value: V) -> Option<V>
+    pub fn insert<'key, I, Q: 'key + ?Sized>(&mut self, key: I, value: V) -> Result<Option<V>, InsertError>
         where I: IntoIterator<Item = &'key Q>,
               Q: ToOwned<Owned = K>,
               K: Borrow<Q>
@@ -229,30 +260,64 @@ impl<K, V, S> SequenceTrie<K, V, S>
     ///
     /// This function is used internally by `insert`.
     #[cfg(not(feature = "btreemap"))]
-    pub fn insert_owned<I>(&mut self, key: I, value: V) -> Option<V>
+    pub fn insert_owned<I>(&mut self, key: I, value: V) -> Result<Option<V>, InsertError>
         where I: IntoIterator<Item = K>
     {
-        let key_node = key.into_iter().fold(self, |current_node, fragment| {
-            let hash_builder = current_node.children.hasher().clone();
-            current_node.children
-                .entry(fragment)
-                .or_insert_with(|| Self::with_hasher(hash_builder))
-        });
+        let key_node = key.into_iter().fold(Ok(self), |current_node, fragment| {
+            match current_node {
+                Ok(node) => {
+                    // If a node before the last key part has a value, we don't want to create children of
+                    // that node.
+                    if node.values_at_leaves && node.value.is_some() {
+                        return Err(InsertError::NonLeafNodeHasValue);
+                    }
 
-        mem::replace(&mut key_node.value, Some(value))
+                    let hash_builder = node.children.hasher().clone();
+                    let values_at_leaves = node.values_at_leaves;
+                    Ok(node.children
+                        .entry(fragment)
+                        .or_insert_with(|| Self::with_hasher(hash_builder, values_at_leaves)))
+                },
+                Err(e) => Err(e),
+            }
+        })?;
+
+        // If the key node has children we don't want to insert a value at the node.
+        if key_node.values_at_leaves && !key_node.children.is_empty() {
+            Err(InsertError::LeafNodeHasChildren)
+        } else {
+            Ok(mem::replace(&mut key_node.value, Some(value)))
+        }
     }
 
     #[cfg(feature = "btreemap")]
-    pub fn insert_owned<I>(&mut self, key: I, value: V) -> Option<V>
+    pub fn insert_owned<I>(&mut self, key: I, value: V) -> Result<Option<V>, InsertError>
         where I: IntoIterator<Item = K>
     {
-        let key_node = key.into_iter().fold(self, |current_node, fragment| {
-            current_node.children
-                .entry(fragment)
-                .or_insert_with(Self::new_generic)
-        });
+        let key_node = key.into_iter().fold(Ok(self), |current_node, fragment| {
+            match current_node {
+                Ok(node) => {
+                    // If a node before the last key part has a value, we don't want to create children of
+                    // that node.
+                    if node.values_at_leaves && node.value.is_some() {
+                        return Err(InsertError::NonLeafNodeHasValue);
+                    }
 
-        mem::replace(&mut key_node.value, Some(value))
+                    let values_at_leaves = node.values_at_leaves;
+                    Ok(node.children
+                        .entry(fragment)
+                        .or_insert_with(|| Self::new_generic(values_at_leaves)))
+                },
+                Err(e) => Err(e),
+            }
+        })?;
+
+        // If the key node has children we don't want to insert a value at the node.
+        if key_node.values_at_leaves && !key_node.children.is_empty() {
+            Err(InsertError::LeafNodeHasChildren)
+        } else {
+            Ok(mem::replace(&mut key_node.value, Some(value)))
+        }
     }
 
     /// Finds a reference to a key's value, if it has one.
@@ -605,9 +670,9 @@ impl<K, V, S> Default for SequenceTrie<K, V, S>
 {
     fn default() -> Self {
         #[cfg(not(feature = "btreemap"))]
-        { SequenceTrie::with_hasher(S::default()) }
+        { SequenceTrie::with_hasher(S::default(), false) }
         #[cfg(feature = "btreemap")]
-        { SequenceTrie::new_generic() }
+        { SequenceTrie::new_generic(false) }
     }
 }
 

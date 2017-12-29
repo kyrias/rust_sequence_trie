@@ -218,3 +218,17 @@ fn non_static_lifetime() {
 
     trie.insert(&[&a[..], &b[..]], 0u32);
 }
+
+#[test]
+fn node_with_value_and_children() {
+    let mut trie = SequenceTrie::new();
+    assert!(trie.insert(&["foo", "bar"], "1").is_ok());
+    assert!(trie.insert(&["foo", "bar", "baz"], "2").is_ok());
+}
+
+#[test]
+fn val_node_with_value_and_children() {
+    let mut trie = SequenceTrie::new_values_at_leaves();
+    assert!(trie.insert(&["foo", "bar"], "1").is_ok());
+    assert!(trie.insert(&["foo", "bar", "baz"], "2").is_err());
+}
